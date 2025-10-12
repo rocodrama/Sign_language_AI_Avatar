@@ -1,0 +1,26 @@
+
+# Normalization & data keys
+fps: 30
+root_joint: "hip"   # we compute from torso if not explicit
+scale: "height"     # or "none"
+use_3d: true
+use_face: true
+use_hands: true
+joints:
+  body: 25
+  hand_left: 21
+  hand_right: 21
+  face: 70
+keys:
+  pose3d: ["pose_keypoints_3d"]
+  handL3d: ["hand_left_keypoints_3d"]
+  handR3d: ["hand_right_keypoints_3d"]
+  face3d: ["face_keypoints_3d"]
+  # 2D fallbacks if 3D missing:
+  pose2d: ["pose_keypoints_2d"]
+  handL2d: ["hand_left_keypoints_2d"]
+  handR2d: ["hand_right_keypoints_2d"]
+  face2d: ["face_keypoints_2d"]
+clip_seconds:
+  min: 1.5
+  max: 3.0

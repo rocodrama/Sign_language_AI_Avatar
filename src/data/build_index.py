@@ -1,40 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Universal dataset indexer for NIA-style sign-language sets.
+Progress-enabled dataset indexer for NIA-style sign-language sets.
+- Works with videos or JSON-only.
+- Shows a progress bar and per-step logs when --progress / --verbose are enabled.
 
-Works in THREE scenarios:
-  (A) Full set: videos + keypoint/morpheme JSONs
-  (B) JSON-only: ONLY keypoint/morpheme JSONs present (no videos)  <-- your case
-  (C) Seed-driven: merge extra columns from a seed CSV (train/val/manifest)
-
-Outputs:
-  - index.csv: rows keyed by "stem" (filename without extension), with:
-      dataset_type(SEN/WORD/FS), bucket(REAL/SYN/CROWDxx), source, view(F/U/D/R/L),
-      video_path (may be empty), keypoint_json, morpheme_json,
-      has_video, has_keypoint, has_morpheme
-  - index_missing.csv: subset where at least one of the three is missing
-
-Matching rules:
-  - Primary key is filename stem. If an exact stem match fails, the script
-    tries again after stripping a trailing view suffix _F/_U/_D/_R/_L.
-  - If multiple JSONs/videos match the same stem, prefer folders named
-    "keypoint"/"pose" and "morpheme"/"morph", and pick the first in sorted order.
-
-Usage example:
-  python build_index_v3.py \
+Usage
+  python build_index_v4.py \
       --root /path/to/DATA_ROOT \
       --out  /path/to/index.csv \
-      --relative-to /path/to/DATA_ROOT \
-      [--seed /path/to/seed.csv] \
-      [--seed-key stem]   # column name in seed to join on (default: auto)
+      [--relative-to /path/to/DATA_ROOT] \
+      [--seed /path/to/seed.csv] [--seed-key stem] \
+      [--progress] [--verbose]
 
 """
-
-import argparse, re
+import argparse, re, sys, os
 from pathlib import Path
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None  # if tqdm not available, fall back silently
 
 VIEWS = set(list("FUDRL"))
 
@@ -42,7 +30,6 @@ def norm_sep(p: Path) -> str:
     return str(p).replace("\\", "/")
 
 def stem_no_view(stem: str) -> str:
-    # remove trailing _F/_U/_D/_R/_L
     m = re.match(r"^(.*)_[FUDRL]$", stem, flags=re.IGNORECASE)
     return m.group(1) if m else stem
 
@@ -65,7 +52,6 @@ def infer_dataset_type_from_path(p: Path) -> Optional[str]:
     return None
 
 def infer_bucket_from_path(p: Path) -> Optional[str]:
-    # e.g., REAL / SYN / CROWD under the first levels
     parts = norm_sep(p).split("/")
     for token in parts:
         t = token.upper()
@@ -73,7 +59,7 @@ def infer_bucket_from_path(p: Path) -> Optional[str]:
             return t
     return None
 
-def read_seed(seed_path: Optional[Path]) -> Optional[pd.DataFrame]:
+def read_seed(seed_path: Optional[Path], verbose=False) -> Optional[pd.DataFrame]:
     if not seed_path: return None
     encs = ["utf-8", "utf-8-sig", "cp949", "euc-kr", "latin1"]
     seps = [",", "\t", ";", "|"]
@@ -83,22 +69,30 @@ def read_seed(seed_path: Optional[Path]) -> Optional[pd.DataFrame]:
             try:
                 df = pd.read_csv(seed_path, encoding=enc, sep=sep, engine="python")
                 if df.shape[1] >= 1:
+                    if verbose:
+                        print(f"[SEED] Loaded {seed_path} enc={enc} sep={repr(sep)} shape={df.shape}")
                     return df
             except Exception as e:
                 last = e
     raise last if last else RuntimeError("Failed to read seed CSV")
 
-def scan_files(root: Path):
+def scan_files(root: Path, progress=False, verbose=False):
     videos: Dict[str, List[Path]] = {}
     kp_jsons: Dict[str, List[Path]] = {}
     morph_jsons: Dict[str, List[Path]] = {}
 
-    for p in root.rglob("*"):
+    it = root.rglob("*")
+    if progress and tqdm is not None:
+        it = tqdm(it, desc="Scanning files", unit="file")
+
+    count = 0
+    for p in it:
         if not p.is_file():
             continue
         name = p.name
         low = name.lower()
         s = p.stem
+        count += 1
         if low.endswith(".mp4"):
             videos.setdefault(s, []).append(p)
         elif low.endswith(".json"):
@@ -108,33 +102,35 @@ def scan_files(root: Path):
             elif "morpheme" in parent or "morph" in parent:
                 morph_jsons.setdefault(s, []).append(p)
             else:
-                # fallback by filename keywords
                 if ("keypoint" in low) or ("pose" in low):
                     kp_jsons.setdefault(s, []).append(p)
                 if ("morpheme" in low) or ("morph" in low):
                     morph_jsons.setdefault(s, []).append(p)
+    if verbose:
+        print(f"[SCAN] videos={sum(len(v) for v in videos.values())}, keypoints={sum(len(v) for v in kp_jsons.values())}, morphs={sum(len(v) for v in morph_jsons.values())}")
     return videos, kp_jsons, morph_jsons
 
 def choose_first(paths: List[Path], prefer_keywords: Tuple[str, ...]) -> Optional[Path]:
     if not paths: return None
-    # Prefer directory keywords if available
     for p in sorted(paths):
         parent = p.parent.name.lower()
         if any(k in parent for k in prefer_keywords):
             return p
     return sorted(paths)[0]
 
-def build_index(root: Path, seed_df: Optional[pd.DataFrame], seed_key: Optional[str], relative_to: Optional[Path]) -> pd.DataFrame:
-    videos, kp_jsons, morph_jsons = scan_files(root)
+def build_index(root: Path, seed_df: Optional[pd.DataFrame], seed_key: Optional[str], relative_to: Optional[Path], progress=False, verbose=False) -> pd.DataFrame:
+    videos, kp_jsons, morph_jsons = scan_files(root, progress=progress, verbose=verbose)
 
-    # Build the driving key set from union of stems (videos ∪ JSONs)
     stems = set(videos.keys()) | set(kp_jsons.keys()) | set(morph_jsons.keys())
-    # Also add stems with view suffix stripped, to ensure coverage
     stems |= {stem_no_view(s) for s in list(stems)}
+    stems = sorted(stems)
 
     rows = []
-    for stem in sorted(stems):
-        # try exact then no-view
+    iterator = stems
+    if progress and tqdm is not None:
+        iterator = tqdm(stems, desc="Matching stems", unit="stem")
+
+    for stem in iterator:
         vpaths = videos.get(stem) or videos.get(stem_no_view(stem)) or []
         kp_paths = kp_jsons.get(stem) or kp_jsons.get(stem_no_view(stem)) or []
         morph_paths = morph_jsons.get(stem) or morph_jsons.get(stem_no_view(stem)) or []
@@ -154,8 +150,9 @@ def build_index(root: Path, seed_df: Optional[pd.DataFrame], seed_key: Optional[
 
         view = infer_view_from_name(vname) or infer_view_from_name(stem)
         source = infer_source_from_name(vname) or infer_source_from_name(stem)
-        dataset_type = infer_dataset_type_from_path(vpath or (kp_paths[0] if kp_paths else (mpath if mpath else root)))
-        bucket = infer_bucket_from_path(vpath or (kp_paths[0] if kp_paths else (mpath if mpath else root)))
+        hint_path = vpath or (kp_paths[0] if kp_paths else (mpath if mpath else root))
+        dataset_type = infer_dataset_type_from_path(hint_path)
+        bucket = infer_bucket_from_path(hint_path)
 
         rows.append({
             "stem": stem,
@@ -173,15 +170,15 @@ def build_index(root: Path, seed_df: Optional[pd.DataFrame], seed_key: Optional[
 
     out_df = pd.DataFrame(rows)
 
-    # Merge seed if given
     if seed_df is not None:
-        # auto-detect join key in seed if not provided
         if seed_key is None:
             for cand in ["stem", "video_stem", "basename", "video", "file", "name"]:
                 if cand in seed_df.columns:
                     seed_key = cand
                     break
         if seed_key is not None and seed_key in seed_df.columns:
+            if verbose:
+                print(f"[SEED] Merging on seed key: {seed_key}")
             out_df = out_df.merge(seed_df, left_on="stem", right_on=seed_key, how="left")
         else:
             print(f"[WARN] Could not find a suitable join key in seed; skipping merge. (seed_key={seed_key})")
@@ -194,15 +191,18 @@ def main():
     ap.add_argument("--out", type=Path, required=True, help="Output CSV path")
     ap.add_argument("--relative-to", type=Path, default=None, help="Make paths relative to this dir")
     ap.add_argument("--seed", type=Path, default=None, help="Optional seed CSV")
-    ap.add_argument("--seed-key", type=str, default=None, help="Column in seed to join on; defaults to auto-detect")
+    ap.add_argument("--seed-key", type=str, default=None, help="Join key in seed; auto-detect if omitted")
+    ap.add_argument("--progress", action="store_true", help="Show progress bars (requires tqdm)")
+    ap.add_argument("--verbose", action="store_true", help="Print detailed logs")
     args = ap.parse_args()
 
     root = args.root.resolve()
-    seed_df = read_seed(args.seed)
+    seed_df = read_seed(args.seed, verbose=args.verbose)
 
-    df = build_index(root, seed_df, args.seed_key, args.relative_to)
+    df = build_index(root, seed_df, args.seed_key, args.relative_to, progress=args.progress, verbose=args.verbose)
 
     # Save main CSV
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.out, index=False, encoding="utf-8-sig")
 
     # Save missing report

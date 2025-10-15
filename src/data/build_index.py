@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from typing import Optional
 import argparse, re, sys
 from pathlib import Path
 import pandas as pd
@@ -78,8 +79,9 @@ def main():
         mpath = morph_map.get(s)
 
         # 경로를 상대/절대로 출력
-        def rel(p: Path|None):
-            if p is None: return None
+        def rel(p: Optional[Path]):
+            if p is None:
+                return None
             p = p.resolve()
             if args.relative_to:
                 return norm_sep(p.relative_to(args.relative_to.resolve()))

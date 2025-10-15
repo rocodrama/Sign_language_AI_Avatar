@@ -5,11 +5,12 @@ Pack NIA-style frame JSONs into a single [T,J,C] .npy per stem,
 and write an index_withnpy.csv that adds 'keypoint_npy' column.
 
 - Compatible with NumPy 2.0 (no .ptp usage).
-- Supports relative paths (use --relative-to same as build_index.py).
+- Compatible with Python 3.8/3.9 (no '|' union types).
 """
 
 import argparse, re, json
 from pathlib import Path
+from typing import Optional, Tuple, List
 import numpy as np
 import pandas as pd
 
@@ -21,14 +22,14 @@ except Exception:
 STEM_RE = re.compile(r"(.*)_(\d{6,})_keypoints\.json$", re.IGNORECASE)
 
 def nanptp(a, axis=None):
-    """NumPy 2.0-safe range = nanmax - nanmin."""
+    """Range = nanmax - nanmin (NumPy 2.0-safe)."""
     return np.nanmax(a, axis=axis) - np.nanmin(a, axis=axis)
 
-def load_frame_json(p: Path):
+def load_frame_json(p: Path) -> Optional[np.ndarray]:
     d = json.loads(p.read_text(encoding="utf-8"))
     ppl = d.get("people", d.get("People", {}))
 
-    def pick3d2d(k3, k2):
+    def pick3d2d(k3: str, k2: str):
         if isinstance(ppl, dict):
             v3 = ppl.get(k3, None)
             v2 = ppl.get(k2, None)
@@ -44,39 +45,41 @@ def load_frame_json(p: Path):
     rh,   rC = pick3d2d("hand_right_keypoints_3d", "hand_right_keypoints_2d")
     face, fC = pick3d2d("face_keypoints_3d", "face_keypoints_2d")
 
-    parts = []
-    if body is not None: parts.append(("body", body, bC))
-    if lh   is not None: parts.append(("lh",   lh,   lC))
-    if rh   is not None: parts.append(("rh",   rh,   rC))
-    if face is not None: parts.append(("face", face, fC))
+    parts: List[np.ndarray] = []
+    coord_dim: Optional[int] = None
+
+    def take_coords(vec: np.ndarray, C: int) -> np.ndarray:
+        step = C + 1  # assume trailing score
+        if vec.size % step == 0:
+            arr = vec.reshape(-1, step)[:, :C]
+        else:
+            if vec.size % C != 0:
+                raise ValueError(f"Unexpected vector length {vec.size} for coord_dim={C}")
+            arr = vec.reshape(-1, C)
+        return arr
+
+    if body is not None: parts.append(take_coords(body, bC))
+    if lh   is not None: parts.append(take_coords(lh,   lC))
+    if rh   is not None: parts.append(take_coords(rh,   rC))
+    if face is not None: parts.append(take_coords(face, fC))
     if not parts:
         return None
 
     out = []
-    coord_dim = None
-    for _, vec, C in parts:
-        # vec: flattened (x,y[,z],score) repeats OR just coords
-        step = C + 1  # assume score present
-        if vec.size % step == 0:
-            arr = vec.reshape(-1, step)[:, :C]  # drop score
-        else:
-            if vec.size % C != 0:
-                return None
-            arr = vec.reshape(-1, C)
-
+    for arr in parts:
         if coord_dim is None:
             coord_dim = arr.shape[1]
-        else:
-            if arr.shape[1] != coord_dim:
-                coord_dim = 2
-                out = [o[:, :2] for o in out]
-                arr = arr[:, :2]
+        elif arr.shape[1] != coord_dim:
+            # mix of 2D/3D -> fallback to 2D
+            coord_dim = 2
+            out = [o[:, :2] for o in out]
+            arr = arr[:, :2]
         out.append(arr)
 
     frame = np.concatenate(out, axis=0)  # [J, C]
     return frame
 
-def collect_frames(first_json: Path):
+def collect_frames(first_json: Path) -> Tuple[Optional[str], List[Path]]:
     m = STEM_RE.match(first_json.name)
     if not m:
         return None, []
@@ -85,11 +88,10 @@ def collect_frames(first_json: Path):
     frames = sorted(first_json.parent.glob(pattern))
     return stem, frames
 
-def resolve_path(root: Path, val: str, relative_to: Path|None):
+def resolve_path(root: Path, val: str, relative_to: Optional[Path]) -> Path:
     p = Path(val)
     if p.is_absolute():
         return p
-    # treat as relative to data root
     return (root / val)
 
 def main():
@@ -106,7 +108,7 @@ def main():
     relto = Path(args.relative_to).resolve() if args.relative_to else None
     out_root = Path(args.out_root); out_root.mkdir(parents=True, exist_ok=True)
 
-    npy_paths = []
+    npy_paths: List[Optional[str]] = []
     iterator = df.iterrows()
     if tqdm is not None:
         iterator = tqdm(iterator, total=len(df), desc="Packing")
@@ -136,7 +138,10 @@ def main():
 
         seq = []
         for fp in frames:
-            arr = load_frame_json(fp)
+            try:
+                arr = load_frame_json(fp)
+            except Exception:
+                arr = None
             if arr is None:
                 continue
             seq.append(arr[None, ...])  # [1,J,C]
@@ -150,7 +155,6 @@ def main():
         torso = X[:, :min(X.shape[1], 12), :]
         center = torso.mean(axis=1, keepdims=True)
         X -= center
-        # y-range mean as scale
         y_range_per_frame = nanptp(torso[..., 1], axis=1)  # [T]
         scale = float(np.nanmean(y_range_per_frame) + 1e-6)
         if not np.isfinite(scale) or scale <= 0:

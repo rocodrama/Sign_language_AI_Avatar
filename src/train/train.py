@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_diffusion.py
+train_diffusion.py (v2 - Gradient Accumulation 포함)
 
 데이터셋 구조에 맞춘 3D 수어 생성 Diffusion 모델 학습 스크립트.
 - train_withnpy.csv / val_withnpy.csv 사용
 - .npy (포즈)와 _morpheme.json (형태소)을 로드
 - 형태소(gloss)를 조건(condition)으로 사용
 - 가변 길이 시퀀스를 패딩(padding)하여 배치 처리
+- Gradient Accumulation 지원
 """
 
 import argparse
@@ -137,10 +138,7 @@ def build_vocabulary(train_csv_path: Path) -> Dict[str, int]:
     df = pd.read_csv(train_csv_path, encoding="utf-8-sig")
     
     if "gloss" not in df.columns:
-        print("Warning: 'gloss' column not found in CSV. Using morpheme_json (slower).")
-        # 이 경우, Dataset에서 매번 json을 읽어야 하므로 비효율적
-        # 여기서는 build_index.py가 gloss를 CSV에 추가했다고 가정
-        return {"<PAD>": 0, "<UNK>": 1} # 임시
+         raise RuntimeError("CSV에 'gloss' 컬럼이 없습니다. build_index.py 또는 데이터 전처리 코드를 확인하세요.")
 
     glosses = df["gloss"].dropna().unique()
     vocab = {"<PAD>": 0, "<UNK>": 1} # 0=패딩, 1=알수없음
@@ -273,6 +271,14 @@ def main(args):
     # --- 1. 설정 ---
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu is not None else "cpu")
     print(f"Using device: {device}")
+    
+    # Gradient Accumulation 설정
+    accumulation_steps = args.accumulation_steps
+    effective_batch_size = args.batch_size * accumulation_steps
+    print(f"Physical Batch Size: {args.batch_size}")
+    print(f"Accumulation Steps: {accumulation_steps}")
+    print(f"Effective Batch Size: {effective_batch_size}")
+
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -317,7 +323,8 @@ def main(args):
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn_pad,
-        pin_memory=True
+        pin_memory=True,
+        drop_last=True # 누적 스텝 계산을 위해 마지막 배치는 버릴 수 있음
     )
     val_loader = DataLoader(
         val_dataset,
@@ -335,9 +342,14 @@ def main(args):
         sample = train_dataset[0]["pose"]
         _, J, C = sample.shape
         pose_dim = J * C
-        max_len_sample = max(s["pose"].shape[0] for s in train_dataset.df.index.map(lambda i: train_dataset[i]))
-        max_len = min(max_len_sample, args.max_seq_len) # 너무 길면 제한
-        print(f"Detected pose shape: T, J={J}, C={C}. pose_dim={pose_dim}. Max sequence length: {max_len}")
+        
+        # 데이터셋에서 가장 긴 T를 찾아 max_len 설정
+        all_lengths = [len(train_dataset[i]["pose"]) for i in range(len(train_dataset))]
+        max_len_data = max(all_lengths) if all_lengths else args.max_seq_len
+        max_len = min(max_len_data, args.max_seq_len) # 너무 길면 제한
+
+        print(f"Detected pose shape: T, J={J}, C={C}. pose_dim={pose_dim}.")
+        print(f"Max sequence length in data: {max_len_data}, Model max_len set to: {max_len}")
     except Exception as e:
         print(f"Could not determine pose shape from dataset: {e}")
         return
@@ -365,7 +377,10 @@ def main(args):
         train_loss_total = 0.0
         train_pbar = tqdm(train_loader, desc=f"Train Epoch {epoch+1}", leave=False)
         
-        for batch in train_pbar:
+        # *** Gradient Accumulation: zero_grad()를 루프 밖으로 이동 ***
+        optimizer.zero_grad()
+        
+        for i, batch in enumerate(train_pbar):
             if not batch: continue # 빈 배치 스킵
                 
             pose = batch["pose"].to(device)         # (B, T, J, C)
@@ -394,18 +409,24 @@ def main(args):
             # 5. 마스크 적용 (패딩된 부분은 손실에서 제외)
             loss = loss * mask_flat # (B, T, J*C)
             
-            # 배치 평균
-            # .sum() / mask.sum() -> 픽셀(관절) 단위 평균
+            # 6. 배치 평균 및 누적 정규화
             loss = loss.sum() / (mask_flat.sum() * pose_dim + 1e-8) 
+            loss = loss / accumulation_steps
 
-            # 6. 역전파
-            optimizer.zero_grad()
+            # 7. 역전파
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient Clipping
-            optimizer.step()
             
-            train_loss_total += loss.item()
-            train_pbar.set_postfix(loss=loss.item())
+            # 손실 값을 누적 (정규화 복원)
+            train_loss_total += loss.item() * accumulation_steps
+
+            # *** Gradient Accumulation: N 스텝마다 옵티마이저 실행 ***
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient Clipping
+                optimizer.step()
+                optimizer.zero_grad() # 그래디언트 초기화
+
+            # tqdm에 표시되는 손실은 정규화 복원된 값으로 표시
+            train_pbar.set_postfix(loss=(loss.item() * accumulation_steps))
 
         avg_train_loss = train_loss_total / len(train_loader)
         print(f"Average Training Loss: {avg_train_loss:.6f}")
@@ -454,6 +475,8 @@ def main(args):
                 'val_loss': best_val_loss,
                 'vocab': vocab, # 어휘집 저장
                 'pose_dim': pose_dim,
+                'J': J, # 추론 시 복원을 위해 저장
+                'C': C, # 추론 시 복원을 위해 저장
                 'embed_dim': args.embed_dim,
                 'max_len': max_len
             }, ckpt_path)
@@ -468,10 +491,13 @@ if __name__ == "__main__":
     parser.add_argument('--val', type=str, required=True, help='Path to val_withnpy.csv')
     parser.add_argument('--data_root', type=str, required=True, help='Root directory of the dataset (e.g., C:Users...ubiplay)')
     parser.add_argument('--epochs', type=int, default=200, help='Total number of epochs (추천: 200+, 테스트: 30)')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
+    parser.add_argument('--batch_size', type=int, default=4, help='Physical batch size per GPU (4090 추천: 2~8)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU index to use (default: 0)')
     parser.add_argument('--num_workers', type=int, default=2, help='Number of dataloader workers')
     parser.add_argument('--out_dir', type=str, default='runs/checkpoints_diffusion', help='Directory to save checkpoints')
+    
+    # *** Gradient Accumulation 인자 추가 ***
+    parser.add_argument('--accumulation_steps', type=int, default=8, help='Gradient accumulation steps (Effective Batch Size = batch_size * accumulation_steps)')
 
     # --- 모델 및 학습 하이퍼파라미터 ---
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
@@ -487,7 +513,8 @@ if __name__ == "__main__":
     print(f"  --val {args.val}")
     print(f"  --data_root {args.data_root}")
     print(f"  --epochs {args.epochs}")
-    print(f"  --batch_size {args.batch_size}")
+    print(f"  --batch_size {args.batch_size} (Physical)")
+    print(f"  --accumulation_steps {args.accumulation_steps}")
     print(f"  --gpu {args.gpu}")
     print(f"  --num_workers {args.num_workers}")
     print(f"  --out_dir {args.out_dir}")
